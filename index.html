@@ -1,0 +1,178 @@
+import { ObjectId } from 'mongoose';
+import { Message, Conversation } from '../models';
+import ApiError from '../utils/ApiError';
+import io from '../config/socket';
+
+
+export const sendMessage = async ( senderId: string, conversationId: ObjectId, messageBody: { text: string, participants?: string[] }) => {
+
+    let conversation;
+    if (!conversationId) {
+        if (!messageBody.participants || messageBody.participants.length === 0) {
+            throw new ApiError(400, 'Participants are required to create a new conversation');
+        }
+
+        const allParticipants = [...new Set([senderId, ...messageBody.participants])];
+        const type = allParticipants.length === 2 ? 'private' : 'group';
+        const name = type === 'private' ? '' : 'Group Chat';
+
+        conversation = await Conversation.create({
+            participants: allParticipants,
+            name,
+            type
+        });
+    } else {
+        conversation = await Conversation.findOne({
+            _id: conversationId,
+            participants: senderId,
+            is_deleted: false
+        });
+
+        if (!conversation) {
+            throw new ApiError(404, 'Conversation not found or you are not a participant');
+        }
+    }
+
+    const newMessage = await Message.create({
+        conversationId: conversation._id,
+        sender: senderId,
+        text: messageBody.text
+    });
+
+    await Conversation.findByIdAndUpdate(conversation._id, {
+        lastMessage: newMessage._id
+    });
+
+    conversation.participants
+        .filter(participantId => participantId.toString() !== senderId)
+        .forEach(participantId => {
+            io.to(participantId.toString()).emit('newMessage', newMessage);
+        });
+
+    return newMessage;
+};
+
+export const getMessages = async (conversationId: string, userId: string, query: { page?: number; limit?: number } = {}) => {
+    const { page = 1, limit = 20 } = query;
+    const skip = (page - 1) * limit;
+
+    const conversation = await Conversation.findOne({
+        _id: conversationId,
+        participants: userId,
+        is_deleted: false
+    }).populate({
+        path: 'participants',
+        select: 'first_name last_name image_url'
+    });
+    if (!conversation) {
+        throw new ApiError(404, 'Conversation not found or you are not a participant');
+    }
+
+    const messages = await Message.find({
+        conversationId,
+        is_deleted: false
+    }, { __v: 0, is_deleted: 0, updatedAt: 0 })
+        .populate({
+            path: 'sender',
+            select: 'first_name last_name image_url'
+        })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit);
+
+    const totalMessages = await Message.countDocuments({ conversationId, is_deleted: false });
+
+    return {
+        conversation: {
+            id: conversationId,
+            type: conversation.type,
+            name: conversation.name,
+        },
+        messages,
+        pagination: {
+            page,
+            limit,
+            totalMessages,
+            totalPages: Math.ceil(totalMessages / limit),
+        },
+    };
+};
+
+// Update message for is is_read
+// export const updateMessageRead = async (messageId: string, userId: string) => {
+//     const message = await Message.findOne({
+//         _id: messageId,
+//         sender: { $ne: userId },
+//         is_deleted: false
+//     });
+
+//     if (!message) {
+//         throw new ApiError(404, 'Message not found or you are not the receiver');
+//     }
+
+//     message.is_read = true;
+//     await message.save();
+
+//     return message;
+// };
+
+export const updateMessage = async (messageId: string, userId: string, updateBody: { text: string }) => {
+    const message = await Message.findOne({
+        _id: messageId,
+        sender: userId,
+        is_deleted: false
+    });
+
+    if (!message) {
+        throw new ApiError(404, 'Message not found or you are not the sender');
+    }
+
+    message.text = updateBody.text;
+    message.is_edited = true;
+    await message.save();
+
+    const conversation = await Conversation.findById(message.conversationId);
+    if (conversation) {
+        conversation.participants
+            .filter(participantId => participantId.toString() !== userId)
+            .forEach(participantId => {
+                io.to(participantId.toString()).emit('messageUpdated', message);
+            });
+    }
+
+    return message;
+};
+
+export const deleteMessage = async (messageId: string, userId: string) => {
+    const message = await Message.findOne({
+        _id: messageId,
+        sender: userId,
+        is_deleted: false
+    });
+
+    if (!message) {
+        throw new ApiError(404, 'Message not found or you are not the sender');
+    }
+
+    message.is_deleted = true;
+    await message.save();
+
+    const conversation = await Conversation.findById(message.conversationId);
+    if (conversation) {
+        conversation.participants
+            .filter(participantId => participantId.toString() !== userId)
+            .forEach(participantId => {
+                io.to(participantId.toString()).emit('messageDeleted', messageId);
+            });
+    }
+
+    return message;
+};
+
+export default {
+    sendMessage,
+    getMessages,
+    // updateMessageRead,
+    updateMessage,
+    deleteMessage
+};
